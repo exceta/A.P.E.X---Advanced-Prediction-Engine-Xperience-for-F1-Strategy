@@ -1,6 +1,7 @@
 // F1 2026 predictions client (Supabase-backed).
 import { Race, teamColors } from '../data/mock';
 import { supabase } from '../lib/supabase';
+import { fetchT } from './f1';
 
 export interface RacePredictionRow {
   gp_name: string;
@@ -44,6 +45,9 @@ export interface PredictionItem {
   top10Pct?: number;
   poleHint?: number;
   q3Hint?: number;
+  // Actual result (filled when race is completed)
+  actualPosition?: number;
+  predictedPosition?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -162,6 +166,111 @@ export function resolvePredictorGpName(race: Race): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+//  Actual results from Jolpica / Ergast
+// ─────────────────────────────────────────────────────────────────────
+export interface ActualResults {
+  race: Map<string, number>;   // driver code → finishing position
+  quali: Map<string, number>;  // driver code → qualifying position
+}
+
+// Our OpenF1-derived round numbers can differ from the official FIA / Ergast
+// round numbers (e.g. cancelled races inflate our index). This helper resolves
+// the correct Jolpica round by matching the GP name from the Ergast schedule.
+let _jolpicaScheduleCache: { raceName: string; round: number }[] | null = null;
+
+async function resolveJolpicaRound(raceObj: Race): Promise<number | null> {
+  // 1. Try to load (and cache) the full Jolpica 2026 schedule
+  if (!_jolpicaScheduleCache) {
+    try {
+      const res = await fetchT('https://api.jolpi.ca/ergast/f1/2026.json', 10000);
+      if (res.ok) {
+        const json = await res.json();
+        const races = json?.MRData?.RaceTable?.Races;
+        if (Array.isArray(races)) {
+          _jolpicaScheduleCache = races.map((r: any) => ({
+            raceName: (r.raceName || '').toLowerCase(),
+            round: parseInt(r.round),
+          }));
+        }
+      }
+    } catch (e) {
+      console.warn('[Predictions] Failed to fetch Jolpica schedule for round resolution:', e);
+    }
+  }
+
+  if (!_jolpicaScheduleCache) return null;
+
+  // 2. Match by GP name (our resolvePredictorGpName maps to canonical names
+  //    like "Miami Grand Prix" which matches Jolpica's "Miami Grand Prix").
+  const predictorName = resolvePredictorGpName(raceObj).toLowerCase();
+  const openf1Name = raceObj.name.toLowerCase();
+
+  const match = _jolpicaScheduleCache.find(
+    (r) => r.raceName === predictorName || r.raceName === openf1Name
+  );
+  if (match) return match.round;
+
+  // 3. Fuzzy fallback: check if any schedule entry name contains the key word
+  //    from our race name (e.g. "miami", "canadian")
+  const keyword = openf1Name.replace(/grand prix$/i, '').trim();
+  if (keyword) {
+    const fuzzy = _jolpicaScheduleCache.find((r) => r.raceName.includes(keyword));
+    if (fuzzy) return fuzzy.round;
+  }
+
+  return null;
+}
+
+export async function fetchActualResults(raceObj: Race): Promise<ActualResults> {
+  const race = new Map<string, number>();
+  const quali = new Map<string, number>();
+
+  // Resolve the correct Jolpica round (may differ from our synthetic round)
+  const jolpicaRound = await resolveJolpicaRound(raceObj);
+  if (jolpicaRound == null) {
+    console.warn(`[Predictions] Could not resolve Jolpica round for "${raceObj.name}" — skipping actual results`);
+    return { race, quali };
+  }
+
+  console.log(`[Predictions] Resolved "${raceObj.name}" (app round ${raceObj.round}) → Jolpica round ${jolpicaRound}`);
+
+  try {
+    const [raceRes, qualiRes] = await Promise.all([
+      fetchT(`https://api.jolpi.ca/ergast/f1/2026/${jolpicaRound}/results.json`, 10000),
+      fetchT(`https://api.jolpi.ca/ergast/f1/2026/${jolpicaRound}/qualifying.json`, 10000),
+    ]);
+
+    if (raceRes.ok) {
+      const json = await raceRes.json();
+      const results = json?.MRData?.RaceTable?.Races?.[0]?.Results;
+      if (Array.isArray(results)) {
+        for (const r of results) {
+          const code = r.Driver?.code;
+          const pos = parseInt(r.position);
+          if (code && !isNaN(pos)) race.set(code, pos);
+        }
+      }
+    }
+
+    if (qualiRes.ok) {
+      const json = await qualiRes.json();
+      const results = json?.MRData?.RaceTable?.Races?.[0]?.QualifyingResults;
+      if (Array.isArray(results)) {
+        for (const r of results) {
+          const code = r.Driver?.code;
+          const pos = parseInt(r.position);
+          if (code && !isNaN(pos)) quali.set(code, pos);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[Predictions] Failed to fetch actual results:', e);
+  }
+
+  return { race, quali };
+}
+
+// ─────────────────────────────────────────────────────────────────────
 //  Supabase reads
 // ─────────────────────────────────────────────────────────────────────
 export async function fetchPredictionsForRace(
@@ -172,7 +281,9 @@ export async function fetchPredictionsForRace(
   predictorGp: string;
 }> {
   const predictorGp = resolvePredictorGpName(race);
-  const [raceRes, qualiRes] = await Promise.all([
+
+  // Fetch predictions and actual results in parallel
+  const [raceRes, qualiRes, actuals] = await Promise.all([
     supabase
       .from('race_predictions')
       .select('*')
@@ -183,6 +294,7 @@ export async function fetchPredictionsForRace(
       .select('*')
       .eq('gp_name', predictorGp)
       .order('predicted_grid', { ascending: true }),
+    race.status === 'completed' ? fetchActualResults(race) : Promise.resolve(null),
   ]);
 
   if (raceRes.error) throw new Error(`Race predictions fetch failed: ${raceRes.error.message}`);
@@ -191,9 +303,26 @@ export async function fetchPredictionsForRace(
   const raceRows = (raceRes.data ?? []) as RacePredictionRow[];
   const qualiRows = (qualiRes.data ?? []) as QualiPredictionRow[];
 
+  let raceItems = racePredictionsToItems(raceRows);
+  let qualiItems = qualiPredictionsToItems(qualiRows);
+
+  // Merge actual positions into prediction items
+  if (actuals) {
+    raceItems = raceItems.map((item, i) => ({
+      ...item,
+      predictedPosition: i + 1,
+      actualPosition: actuals.race.get(item.driver),
+    }));
+    qualiItems = qualiItems.map((item, i) => ({
+      ...item,
+      predictedPosition: i + 1,
+      actualPosition: actuals.quali.get(item.driver),
+    }));
+  }
+
   return {
     predictorGp,
-    raceItems: racePredictionsToItems(raceRows),
-    qualiItems: qualiPredictionsToItems(qualiRows),
+    raceItems,
+    qualiItems,
   };
 }
