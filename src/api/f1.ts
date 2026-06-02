@@ -20,14 +20,16 @@ interface CacheItem<T> {
 async function fetchWithCache<T>(
   cacheKey: string,
   fetcher: () => Promise<T>,
-  fallbackData: T
+  fallbackData: T,
+  ttlMs?: number,
 ): Promise<T> {
+  const ttl = ttlMs ?? getCacheTTL();
   try {
     const cachedString = localStorage.getItem(cacheKey);
     if (cachedString) {
       const cachedData: CacheItem<T> = JSON.parse(cachedString);
       const now = Date.now();
-      if (now - cachedData.timestamp < getCacheTTL()) {
+      if (now - cachedData.timestamp < ttl) {
         console.log(`[Cache Hit] Serving ${cacheKey} from localStorage`);
         return cachedData.data;
       }
@@ -218,50 +220,50 @@ async function fetchOpenF1Standings(): Promise<{ drivers: Driver[]; constructors
     s.session_name === 'Race' || s.session_name === 'Sprint'
   );
 
-  const sessionData = await Promise.all(
-    raceSessions.map(async (s: any) => {
-      try {
-        const [rRes, rDrv] = await Promise.all([
-          fetchT(`${OPENF1_URL}/session_result?session_key=${s.session_key}`, 12000),
-          fetchT(`${OPENF1_URL}/drivers?session_key=${s.session_key}`, 12000),
-        ]);
-        const results = rRes.ok ? await rRes.json() : [];
-        const rosterRaw = rDrv.ok ? await rDrv.json() : [];
+  if (raceSessions.length === 0) {
+    throw new Error('No scoring sessions for standings');
+  }
 
-        const rosterMap = new Map<number, any>();
-        for (const r of rosterRaw) {
-          if (!rosterMap.has(r.driver_number)) rosterMap.set(r.driver_number, r);
-        }
-        return { results, rosterMap };
-      } catch (_) {
-        return { results: [] as any[], rosterMap: new Map<number, any>() };
-      }
-    })
-  );
+  // Bulk fetch (~2 requests) instead of 2× per session (was 60+ calls, very slow).
+  const keysParam = raceSessions.map((s: any) => `session_key=${s.session_key}`).join('&');
+  const [rRes, rDrv] = await Promise.all([
+    fetchT(`${OPENF1_URL}/session_result?${keysParam}`, 20000),
+    fetchT(`${OPENF1_URL}/drivers?${keysParam}`, 20000),
+  ]);
+
+  const results: any[] = rRes.ok ? await rRes.json() : [];
+  const rosterRaw: any[] = rDrv.ok ? await rDrv.json() : [];
+
+  const rosterBySession = new Map<number, Map<number, any>>();
+  for (const r of rosterRaw) {
+    const sk = r.session_key as number;
+    if (!rosterBySession.has(sk)) rosterBySession.set(sk, new Map());
+    const sessionMap = rosterBySession.get(sk)!;
+    if (!sessionMap.has(r.driver_number)) sessionMap.set(r.driver_number, r);
+  }
 
   const pointsByDriver = new Map<number, number>();
   const pointsByTeam = new Map<string, { points: number; color: string }>();
 
-  for (const { results, rosterMap } of sessionData) {
-    for (const row of results) {
-      if (!row || typeof row.driver_number !== 'number') continue;
-      const pts = typeof row.points === 'number' ? row.points : 0;
+  for (const row of results) {
+    if (!row || typeof row.driver_number !== 'number') continue;
+    const pts = typeof row.points === 'number' ? row.points : 0;
 
-      pointsByDriver.set(
-        row.driver_number,
-        (pointsByDriver.get(row.driver_number) || 0) + pts
-      );
+    pointsByDriver.set(
+      row.driver_number,
+      (pointsByDriver.get(row.driver_number) || 0) + pts
+    );
 
-      const drv = rosterMap.get(row.driver_number);
-      const team = drv?.team_name;
-      if (team) {
-        const color = drv.team_colour
-          ? `#${drv.team_colour}`
-          : resolveDriverColor(team);
-        const ex = pointsByTeam.get(team) || { points: 0, color };
-        ex.points += pts;
-        pointsByTeam.set(team, ex);
-      }
+    const sessionRoster = rosterBySession.get(row.session_key);
+    const drv = sessionRoster?.get(row.driver_number);
+    const team = drv?.team_name;
+    if (team) {
+      const color = drv.team_colour
+        ? `#${drv.team_colour}`
+        : resolveDriverColor(team);
+      const ex = pointsByTeam.get(team) || { points: 0, color };
+      ex.points += pts;
+      pointsByTeam.set(team, ex);
     }
   }
 
@@ -359,16 +361,57 @@ async function fetchConstructorsFromSupabase(): Promise<Constructor[] | null> {
   return mapSupabaseConstructors(data);
 }
 
+const STANDINGS_CACHE_TTL = 10 * 60 * 1000; // 10 min — avoid stale points for days
+
+function isDbStandingsStale(db: Driver[], live: Driver[]): boolean {
+  if (!db.length || !live.length) return false;
+  return (live[0]?.points ?? 0) > (db[0]?.points ?? 0);
+}
+
+async function fetchChampionshipStandings(): Promise<{
+  drivers: Driver[];
+  constructors: Constructor[];
+}> {
+  return fetchWithCache(
+    'f1_championship_standings_v7',
+    async () => {
+      const [fromDbDrivers, fromDbConstructors, live] = await Promise.all([
+        fetchDriversFromSupabase(),
+        fetchConstructorsFromSupabase(),
+        getOpenF1StandingsShared().catch((e) => {
+          console.warn('[Standings] OpenF1 fetch failed:', e);
+          return null;
+        }),
+      ]);
+
+      const liveDrivers = live?.drivers ?? [];
+      const liveConstructors = live?.constructors ?? [];
+
+      if (
+        liveDrivers.length &&
+        (!fromDbDrivers?.length || isDbStandingsStale(fromDbDrivers, liveDrivers))
+      ) {
+        return { drivers: liveDrivers, constructors: liveConstructors };
+      }
+
+      if (fromDbDrivers?.length && fromDbConstructors?.length) {
+        return { drivers: fromDbDrivers, constructors: fromDbConstructors };
+      }
+
+      if (liveDrivers.length) {
+        return { drivers: liveDrivers, constructors: liveConstructors };
+      }
+
+      throw new Error('No championship standings available');
+    },
+    { drivers: mockDrivers, constructors: mockConstructors.map(c => ({ ...c, color: resolveDriverColor(c.name) })) },
+    STANDINGS_CACHE_TTL,
+  );
+}
+
 export async function fetchAllDrivers(): Promise<Driver[]> {
-  return fetchWithCache('f1_driver_standings_v6', async () => {
-    const fromDb = await fetchDriversFromSupabase();
-    if (fromDb?.length) return fromDb;
-
-    const { drivers } = await getOpenF1StandingsShared();
-    if (drivers.length) return drivers;
-
-    throw new Error('No driver standings available');
-  }, mockDrivers);
+  const { drivers } = await fetchChampionshipStandings();
+  return drivers;
 }
 
 export async function fetchDriversChampionship(): Promise<Driver[]> {
@@ -377,15 +420,8 @@ export async function fetchDriversChampionship(): Promise<Driver[]> {
 }
 
 export async function fetchAllConstructors(): Promise<Constructor[]> {
-  return fetchWithCache('f1_constructor_standings_v6', async () => {
-    const fromDb = await fetchConstructorsFromSupabase();
-    if (fromDb?.length) return fromDb;
-
-    const { constructors } = await getOpenF1StandingsShared();
-    if (constructors.length) return constructors;
-
-    throw new Error('No constructor standings available');
-  }, mockConstructors.map(c => ({ ...c, color: resolveDriverColor(c.name) })));
+  const { constructors } = await fetchChampionshipStandings();
+  return constructors;
 }
 
 export async function fetchConstructorsChampionship(): Promise<Constructor[]> {

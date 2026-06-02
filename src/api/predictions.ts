@@ -92,6 +92,7 @@ export function racePredictionsToItems(
       expectedFinish: r.expected_finish ?? undefined,
       podiumPct: r.podium_pct ?? undefined,
       top10Pct: r.top10_pct ?? undefined,
+      predictedPosition: r.predicted_rank ?? undefined,
     }));
 }
 
@@ -110,6 +111,7 @@ export function qualiPredictionsToItems(
       color: resolveTeamColor(r.team_name),
       poleHint: r.pole_pct ?? undefined,
       q3Hint: r.q3_pct ?? undefined,
+      predictedPosition: r.predicted_grid ?? undefined,
     }));
 }
 
@@ -166,108 +168,94 @@ export function resolvePredictorGpName(race: Race): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-//  Actual results from Jolpica / Ergast
+//  Actual results (OpenF1 — same source as standings sync)
 // ─────────────────────────────────────────────────────────────────────
 export interface ActualResults {
   race: Map<string, number>;   // driver code → finishing position
   quali: Map<string, number>;  // driver code → qualifying position
 }
 
-// Our OpenF1-derived round numbers can differ from the official FIA / Ergast
-// round numbers (e.g. cancelled races inflate our index). This helper resolves
-// the correct Jolpica round by matching the GP name from the Ergast schedule.
-let _jolpicaScheduleCache: { raceName: string; round: number }[] | null = null;
+const OPENF1_URL = 'https://api.openf1.org/v1';
 
-async function resolveJolpicaRound(raceObj: Race): Promise<number | null> {
-  // 1. Try to load (and cache) the full Jolpica 2026 schedule
-  if (!_jolpicaScheduleCache) {
-    try {
-      const res = await fetchT('https://api.jolpi.ca/ergast/f1/2026.json', 10000);
-      if (res.ok) {
-        const json = await res.json();
-        const races = json?.MRData?.RaceTable?.Races;
-        if (Array.isArray(races)) {
-          _jolpicaScheduleCache = races.map((r: any) => ({
-            raceName: (r.raceName || '').toLowerCase(),
-            round: parseInt(r.round),
-          }));
-        }
+async function loadSessionPositions(
+  sessionKey: number,
+  target: Map<string, number>,
+): Promise<void> {
+  const [resRes, drvRes] = await Promise.all([
+    fetchT(`${OPENF1_URL}/session_result?session_key=${sessionKey}`, 12000),
+    fetchT(`${OPENF1_URL}/drivers?session_key=${sessionKey}`, 12000),
+  ]);
+
+  if (!resRes.ok) return;
+
+  const results = await resRes.json();
+  const drivers = drvRes.ok ? await drvRes.json() : [];
+  if (!Array.isArray(results)) return;
+
+  const abbrByNumber = new Map<number, string>();
+  if (Array.isArray(drivers)) {
+    for (const d of drivers) {
+      if (d.name_acronym && typeof d.driver_number === 'number') {
+        abbrByNumber.set(d.driver_number, d.name_acronym);
       }
-    } catch (e) {
-      console.warn('[Predictions] Failed to fetch Jolpica schedule for round resolution:', e);
     }
   }
 
-  if (!_jolpicaScheduleCache) return null;
-
-  // 2. Match by GP name (our resolvePredictorGpName maps to canonical names
-  //    like "Miami Grand Prix" which matches Jolpica's "Miami Grand Prix").
-  const predictorName = resolvePredictorGpName(raceObj).toLowerCase();
-  const openf1Name = raceObj.name.toLowerCase();
-
-  const match = _jolpicaScheduleCache.find(
-    (r) => r.raceName === predictorName || r.raceName === openf1Name
-  );
-  if (match) return match.round;
-
-  // 3. Fuzzy fallback: check if any schedule entry name contains the key word
-  //    from our race name (e.g. "miami", "canadian")
-  const keyword = openf1Name.replace(/grand prix$/i, '').trim();
-  if (keyword) {
-    const fuzzy = _jolpicaScheduleCache.find((r) => r.raceName.includes(keyword));
-    if (fuzzy) return fuzzy.round;
+  for (const row of results) {
+    const abbr = abbrByNumber.get(row.driver_number);
+    const pos = row.position;
+    if (abbr && typeof pos === 'number') {
+      target.set(abbr, pos);
+    }
   }
-
-  return null;
 }
 
-export async function fetchActualResults(raceObj: Race): Promise<ActualResults> {
+async function fetchActualResultsOpenF1(raceObj: Race): Promise<ActualResults> {
   const race = new Map<string, number>();
   const quali = new Map<string, number>();
 
-  // Resolve the correct Jolpica round (may differ from our synthetic round)
-  const jolpicaRound = await resolveJolpicaRound(raceObj);
-  if (jolpicaRound == null) {
-    console.warn(`[Predictions] Could not resolve Jolpica round for "${raceObj.name}" — skipping actual results`);
+  if (!raceObj.meeting_key) {
     return { race, quali };
   }
 
-  console.log(`[Predictions] Resolved "${raceObj.name}" (app round ${raceObj.round}) → Jolpica round ${jolpicaRound}`);
+  const sessionsRes = await fetchT(
+    `${OPENF1_URL}/sessions?meeting_key=${raceObj.meeting_key}`,
+    12000,
+  );
+  if (!sessionsRes.ok) return { race, quali };
 
-  try {
-    const [raceRes, qualiRes] = await Promise.all([
-      fetchT(`https://api.jolpi.ca/ergast/f1/2026/${jolpicaRound}/results.json`, 10000),
-      fetchT(`https://api.jolpi.ca/ergast/f1/2026/${jolpicaRound}/qualifying.json`, 10000),
-    ]);
+  const sessions = await sessionsRes.json();
+  if (!Array.isArray(sessions)) return { race, quali };
 
-    if (raceRes.ok) {
-      const json = await raceRes.json();
-      const results = json?.MRData?.RaceTable?.Races?.[0]?.Results;
-      if (Array.isArray(results)) {
-        for (const r of results) {
-          const code = r.Driver?.code;
-          const pos = parseInt(r.position);
-          if (code && !isNaN(pos)) race.set(code, pos);
-        }
-      }
-    }
+  const raceSession = sessions.find((s: { session_name?: string }) => s.session_name === 'Race');
+  const qualiSession = sessions.find((s: { session_name?: string }) => {
+    const name = s.session_name ?? '';
+    return name === 'Qualifying' || /sprint qualifying/i.test(name);
+  });
 
-    if (qualiRes.ok) {
-      const json = await qualiRes.json();
-      const results = json?.MRData?.RaceTable?.Races?.[0]?.QualifyingResults;
-      if (Array.isArray(results)) {
-        for (const r of results) {
-          const code = r.Driver?.code;
-          const pos = parseInt(r.position);
-          if (code && !isNaN(pos)) quali.set(code, pos);
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[Predictions] Failed to fetch actual results:', e);
-  }
+  await Promise.all([
+    raceSession ? loadSessionPositions(raceSession.session_key, race) : Promise.resolve(),
+    qualiSession ? loadSessionPositions(qualiSession.session_key, quali) : Promise.resolve(),
+  ]);
 
   return { race, quali };
+}
+
+export async function fetchActualResults(raceObj: Race): Promise<ActualResults> {
+  const openF1 = await fetchActualResultsOpenF1(raceObj);
+  if (openF1.race.size > 0 || openF1.quali.size > 0) {
+    console.log(
+      `[Predictions] Actuals from OpenF1 for "${raceObj.name}":`,
+      openF1.race.size,
+      'race,',
+      openF1.quali.size,
+      'quali',
+    );
+    return openF1;
+  }
+
+  console.warn(`[Predictions] No OpenF1 results for "${raceObj.name}" (meeting_key=${raceObj.meeting_key})`);
+  return openF1;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -308,14 +296,12 @@ export async function fetchPredictionsForRace(
 
   // Merge actual positions into prediction items
   if (actuals) {
-    raceItems = raceItems.map((item, i) => ({
+    raceItems = raceItems.map((item) => ({
       ...item,
-      predictedPosition: i + 1,
       actualPosition: actuals.race.get(item.driver),
     }));
-    qualiItems = qualiItems.map((item, i) => ({
+    qualiItems = qualiItems.map((item) => ({
       ...item,
-      predictedPosition: i + 1,
       actualPosition: actuals.quali.get(item.driver),
     }));
   }
