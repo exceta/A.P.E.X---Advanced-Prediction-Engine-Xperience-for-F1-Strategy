@@ -58,10 +58,9 @@ The XGBoost model achieves 0.88 accuracy with a 0.31 log-loss on held-out race s
 | Member | Role |
 |---|---|
 | Rishikrishnan Gurunathan | Tyre degradation model, React dashboard components, N.I.K.I. LLM assistant |
-| Aakash Selvabaskar | ML pipeline, XGBoost classifier |
-| Abnik Ahilasamy | Data ingestion & API integration |
+| Aakash Selvabaskar | ML pipeline, XGBoost classifier, Race Prediction Model, N.I.K.I. LLM assistant |
+| Abnik Ahilasamy | Data ingestion & API integration, Supabase DB |
 | Sharan Magesh | Backend & Netlify serverless functions |
-| Chinna Sai Prasanth Narsing | Frontend development |
 
 ---
 
