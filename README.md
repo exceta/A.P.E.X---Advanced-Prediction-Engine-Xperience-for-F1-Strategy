@@ -64,43 +64,6 @@ The XGBoost model achieves 0.88 accuracy with a 0.31 log-loss on held-out race s
 
 ---
 
-## 💻 Installation & Usage
-
-**Prerequisites**: Node.js 18+, Python 3.10+
-
-**1. Clone the repository:**
-```bash
-git clone https://github.com/exceta/A.P.E.X---Advanced-Prediction-Engine-Xperience-for-F1-Strategy.git
-cd A.P.E.X---Advanced-Prediction-Engine-Xperience-for-F1-Strategy
-```
-
-**2. Set up environment variables:**
-```bash
-cp .env.example .env
-# Fill in your OpenF1 API key and LLM provider credentials
-```
-
-**3. Run the ML pipeline (Python):**
-```bash
-pip install -r ml_pipeline/requirements.txt
-python ingest_telemetry.py
-# Train models from ml_pipeline/
-```
-
-**4. Install frontend dependencies and run locally:**
-```bash
-npm install
-npm run dev
-```
-
-**5. Deploy to Netlify:**
-```bash
-npm run build
-# Connect repo to Netlify — netlify.toml handles function routing automatically
-```
-
----
-
 ## 🏗️ Project Structure
 
 ```
